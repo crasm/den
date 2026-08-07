@@ -96,8 +96,14 @@ let
       # Forward provides children onto the merged aspect so
       # aspect.docker resolves to aspect.provides.docker.
       # provides-first so direct freeform keys on merged take priority.
-      # __providesForwarded tells the pipeline to skip these during classification.
+      # __providesForwarded tells the pipeline to skip these during
+      # classification — but only for names the aspect does not define
+      # itself. A name held by both loses the forwarded value to the direct
+      # key above, so masking it would classify neither: an aspect declaring
+      # provides.user alongside user-class content would silently emit no
+      # user class at all.
       providesChildren = builtins.removeAttrs (merged.provides or { }) [ "_module" ];
+      unshadowedProvides = builtins.filter (k: !(merged ? ${k})) (builtins.attrNames providesChildren);
       # Child aspect keys for synthetic provides: freeform keys that are
       # not structural, internal, class, pipe, or forwarded-from-provides.
       classReg = den.classes or { };
@@ -132,7 +138,7 @@ let
     // merged
     // {
       __functor = if originalFunctor != null then originalFunctor else resolveAspectWith;
-      __providesForwarded = builtins.attrNames providesChildren;
+      __providesForwarded = unshadowedProvides;
       provides = syntheticProvides;
       _ = syntheticProvides;
     };
@@ -489,45 +495,17 @@ let
                           bv
                       ) b;
                     subForwarded = builtins.foldl' deepMerge { } subAttrVals;
-                    # Multi-def counterpart of annotatedMerged: tag forwarded
-                    # children recursively with __provider, else navigation
-                    # through a multi-def key yields raw children that get
-                    # anon-renamed per inclusion path and double-emit class
-                    # content. Recursive (unlike annotatedMerged) because
-                    # subForwarded never re-enters aspectContentType per
-                    # level. Name-based guards come first — forcing a
-                    # registered class value mid-merge can re-enter the flake
-                    # fixpoint (#580; see isNestedKey); only unregistered
-                    # namespace keys (forced by navigation anyway) get WHNF'd.
-                    annotateDeep =
-                      provPath: attrs:
-                      lib.mapAttrs (
-                        ck: cv:
-                        let
-                          childPath = provPath ++ [ ck ];
-                        in
-                        if
-                          !(lib.hasPrefix "__" ck)
-                          && !(classReg ? ${ck})
-                          && !(pipeReg ? ${ck})
-                          && !(structuralKeysSet ? ${ck})
-                          && builtins.isAttrs cv
-                          && !(cv ? __provider)
-                          && !(cv ? __contentValues)
-                        then
-                          annotateDeep childPath cv // { __provider = childPath; }
-                        else
-                          cv
-                      ) attrs;
                     provBase = (typeCfg.providerPrefix or [ ]) ++ [
                       keyName
                       k
                     ];
+                    annotatedSub = annotateChildren provBase subForwarded;
                   in
-                  annotateDeep provBase subForwarded
+                  annotatedSub
                   // {
                     __contentValues = defsForKey;
                     __provider = provBase;
+                    _ = underscoreAt provBase annotatedSub;
                   }
               );
           # Single-function content wrappers need __functor so the wrapper is
@@ -542,46 +520,61 @@ let
           inherit (den.lib.aspects.fx.keyClassification) structuralKeysSet;
           # Forward provides children onto the wrapper so
           # aspect.child.monitoring resolves to aspect.child.provides.monitoring,
-          # matching mergeWithAspectMeta behavior for root aspects.
+          # matching mergeWithAspectMeta behavior for root aspects — including
+          # the rule that a name the wrapper defines itself keeps its own value
+          # and stays classified.
           providesChildren = builtins.removeAttrs (merged.provides or { }) [ "_module" ];
+          unshadowedProvides = builtins.filter (k: !(merged ? ${k})) (builtins.attrNames providesChildren);
           provider = (typeCfg.providerPrefix or [ ]) ++ [ keyName ];
-          childKeys = builtins.filter (
-            k: !(structuralKeysSet ? ${k}) && !(lib.hasPrefix "__" k) && !(classReg ? ${k}) && !(pipeReg ? ${k})
-          ) (builtins.attrNames merged);
-          aspectName = lib.concatStringsSep "." provider;
-          syntheticAspect = {
-            name = "${aspectName}._";
-            includes = map (k: merged.${k}) childKeys;
+          # A key names a candidate child aspect when it is neither structural,
+          # internal, class nor pipe. Provides children are reached through
+          # `provides`/`_`, which are structural — ._ never collects them.
+          isChildKey =
+            k:
+            !(structuralKeysSet ? ${k}) && !(lib.hasPrefix "__" k) && !(classReg ? ${k}) && !(pipeReg ? ${k});
+          # The synthetic aspect behind ._ at a given tree position.
+          underscoreAt = provPath: attrs: {
+            __functor = _self: _args: {
+              name = "${lib.concatStringsSep "." provPath}._";
+              includes = map (k: attrs.${k}) (builtins.filter isChildKey (builtins.attrNames attrs));
+            };
           };
           # Annotate nested attrset children with __provider so deeply nested
-          # aspects carry provenance for hasAspect resolution.
-          # Only annotate unregistered keys (potential nested aspects) —
-          # skip class keys, pipe keys, structural keys, and internal keys.
-          annotatedMerged = lib.mapAttrs (
-            k: v:
-            if
-              builtins.isAttrs v
-              && !(v ? __provider)
-              && !(v ? __contentValues)
-              && !(lib.hasPrefix "__" k)
-              && !(classReg ? ${k})
-              && !(pipeReg ? ${k})
-              && !(structuralKeysSet ? ${k})
-            then
-              v // { __provider = provider ++ [ k ]; }
-            else
-              v
-          ) merged;
+          # aspects carry provenance for hasAspect resolution, and give each
+          # one its own ._ so the shorthand holds at every depth rather than
+          # only at this wrapper. Without the recursion, navigation through a
+          # nested key also yields raw children that get anon-renamed per
+          # inclusion path and double-emit class content.
+          # Name-based guards come first — forcing a registered class value
+          # mid-merge can re-enter the flake fixpoint (#580; see isNestedKey);
+          # only unregistered namespace keys (forced by navigation anyway) get
+          # WHNF'd.
+          annotateChildren =
+            provPath: attrs:
+            lib.mapAttrs (
+              k: v:
+              let
+                childPath = provPath ++ [ k ];
+                sub = annotateChildren childPath v;
+              in
+              if isChildKey k && builtins.isAttrs v && !(v ? __provider) && !(v ? __contentValues) then
+                sub
+                // {
+                  __provider = childPath;
+                  _ = underscoreAt childPath sub;
+                }
+              else
+                v
+            ) attrs;
+          annotatedMerged = annotateChildren provider merged;
         in
         providesChildren
         // annotatedMerged
         // {
           __contentValues = flatDefs;
           __provider = provider;
-          __providesForwarded = builtins.attrNames providesChildren;
-          _ = {
-            __functor = _self: _args: syntheticAspect;
-          };
+          __providesForwarded = unshadowedProvides;
+          _ = underscoreAt provider annotatedMerged;
         }
         // lib.optionalAttrs singleFn {
           __functor = _self: (builtins.head flatDefs).value;
